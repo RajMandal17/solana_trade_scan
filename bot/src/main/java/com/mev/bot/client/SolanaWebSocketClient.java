@@ -1,6 +1,8 @@
 package com.mev.bot.client;
-// src/main/java/com/example/solana/service/SolanaWebSocketClient.java
+
 import com.mev.bot.config.SolanaProperties;
+import com.mev.bot.entity.Trade;
+import com.mev.bot.repo.TradeRepository;
 import jakarta.websocket.*;
 import lombok.extern.slf4j.Slf4j;
 import org.json.JSONArray;
@@ -10,6 +12,7 @@ import org.springframework.stereotype.Component;
 
 import java.io.IOException;
 import java.net.URI;
+import java.time.LocalDateTime;
 
 @Slf4j
 @Component
@@ -19,9 +22,12 @@ public class SolanaWebSocketClient {
     private final SolanaProperties properties;
     private Session session;
 
+    private final TradeRepository tradeRepository;
+
     @Autowired
-    public SolanaWebSocketClient(SolanaProperties properties) {
+    public SolanaWebSocketClient(SolanaProperties properties, TradeRepository tradeRepository) {
         this.properties = properties;
+        this.tradeRepository = tradeRepository;
         connect();
     }
 
@@ -66,7 +72,6 @@ public class SolanaWebSocketClient {
             JSONObject result = response.getJSONObject("params")
                     .getJSONObject("result")
                     .getJSONObject("value");
-
             processTransaction(result.getJSONArray("logs"));
         }
     }
@@ -95,8 +100,13 @@ public class SolanaWebSocketClient {
     private void processTransaction(JSONArray logs) {
         log.info("🔍 Processing transaction logs: {}", logs);
 
+        Trade trade = new Trade();
+        trade.setTimestamp(LocalDateTime.now());
+        trade.setTransactionLogs(logs.toString());
+
         boolean largeTrade = false;
         double slippage = 0;
+        String poolAddress = "";
 
         for (int i = 0; i < logs.length(); i++) {
             String logEntry = logs.getString(i);
@@ -108,17 +118,46 @@ public class SolanaWebSocketClient {
             if (logEntry.contains("slippage")) {
                 slippage = extractSlippage(logEntry);
             }
+
+            if (logEntry.contains("Tokenkeg")) {
+                poolAddress = extractPoolAddress(logEntry);
+            }
+        }
+
+        trade.setLargeTrade(largeTrade);
+        trade.setSlippage(slippage);
+        trade.setPoolAddress(poolAddress);
+
+        try {
+            Trade savedTrade = tradeRepository.save(trade);
+            log.info("💾 Saved trade to database: ID {}", savedTrade.getId());
+        } catch (Exception e) {
+            log.error("❌ Error saving trade: {}", e.getMessage());
         }
 
         if (largeTrade) {
             log.warn("💰 Large trade detected");
-            // Add additional processing logic
         }
 
         if (slippage > properties.getHighSlippageThreshold()) {
             log.warn("⚠️ High slippage detected: {}%", slippage);
-            // Trigger alert or mitigation logic
         }
+    }
+
+    private String extractPoolAddress(String logEntry) {
+        try {
+            if (logEntry.contains("Tokenkeg")) {
+                String[] parts = logEntry.split(" ");
+                for (String part : parts) {
+                    if (part.length() > 20) {
+                        return part;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.error("Error extracting pool address: {}", e.getMessage());
+        }
+        return "unknown";
     }
 
     private double extractSlippage(String logEntry) {
@@ -133,8 +172,7 @@ public class SolanaWebSocketClient {
         return 0.0;
     }
 
-    @Autowired
-    public void reconnect() {
+    private void reconnect() {
         try {
             if (session != null) {
                 session.close();
